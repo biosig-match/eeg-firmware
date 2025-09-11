@@ -25,6 +25,7 @@ const int EEG_PINS[NUM_EEG_CHANNELS] = {A0, A1, A2, A3, A4, A5, 7, 8};
 #define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define MAX_CHUNK_SIZE 240 // MTUより小さい安全な値
 
 // --- データ構造 ---
 struct __attribute__((packed)) PacketHeader
@@ -49,7 +50,7 @@ volatile bool sampleFlag = false;
 BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
 bool deviceConnected = false;
-volatile bool canSendData = true;
+volatile bool canSendData = false;
 PacketHeader packetHeader;
 SensorData sensorDataBuffer[SAMPLES_PER_PACKET];
 volatile int sampleCounter = 0;
@@ -64,25 +65,47 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
 {
     void onWrite(BLECharacteristic *pCharacteristic)
     {
-        // ★★★ログフォーマット変更★★★
-        Serial.println("➡️  ACK received. Ready for next packet.");
-        canSendData = true;
+        std::string rxValue = pCharacteristic->getValue();
+        int rxLen = rxValue.length();
+
+        Serial.print("[ACK] ➡️  ACK received. Length: ");
+        Serial.print(rxLen);
+        Serial.print(", Value: ");
+        for (int i = 0; i < rxLen; i++)
+        {
+            Serial.printf("%02X ", rxValue[i]);
+        }
+        Serial.println();
+
+        if (rxLen > 0)
+        {
+            if (rxValue[0] == 0xAA) // Sanity Check / Start signal
+            {
+                Serial.println("[ACK] ✅ Start signal (0xAA) received. Ready to send initial packet.");
+                canSendData = true;
+            }
+            else if (rxValue[0] == 0x01) // Regular ACK
+            {
+                Serial.println("[ACK] ✅ Regular ACK (0x01) received. Ready for next packet.");
+                canSendData = true;
+            }
+        }
     }
 };
+
 class MyServerCallbacks : public BLEServerCallbacks
 {
     void onConnect(BLEServer *pServer)
     {
         deviceConnected = true;
-        canSendData = true;
-        // ★★★ログフォーマット変更★★★
-        Serial.println("✅ Client Connected!");
+        canSendData = false;
+        Serial.println("[BLE] ✅ Client Connected! Waiting for start signal (0xAA)...");
     }
     void onDisconnect(BLEServer *pServer)
     {
         deviceConnected = false;
-        // ★★★ログフォーマット変更★★★
-        Serial.println("❌ Client Disconnected. Restarting advertising...");
+        canSendData = false;
+        Serial.println("[BLE] ❌ Client Disconnected. Restarting advertising...");
         pServer->getAdvertising()->start();
     }
 };
@@ -126,13 +149,13 @@ void generate_dummy_sensor_data(SensorData *data_ptr)
 void sendData()
 {
     canSendData = false;
-    // ★★★ログフォーマット変更★★★
-    Serial.printf("Compressing %d samples (%u bytes)...\n", SAMPLES_PER_PACKET, (unsigned int)TOTAL_RAW_SIZE);
+
+    Serial.printf("[DATA] Compressing %d samples (%u bytes)...\n", SAMPLES_PER_PACKET, (unsigned int)TOTAL_RAW_SIZE);
 
     uint8_t *rawBuffer = new uint8_t[TOTAL_RAW_SIZE];
     if (rawBuffer == NULL)
     {
-        Serial.println("Error: Failed to allocate rawBuffer for compression!");
+        Serial.println("[DATA] Error: Failed to allocate rawBuffer for compression!");
         canSendData = true;
         return;
     }
@@ -145,13 +168,12 @@ void sendData()
 
     if (ZSTD_isError(compressedSize))
     {
-        Serial.printf("Compression failed: %s\n", ZSTD_getErrorName(compressedSize));
+        Serial.printf("[DATA] Compression failed: %s\n", ZSTD_getErrorName(compressedSize));
         canSendData = true;
         return;
     }
 
-    // ★★★ログフォーマット変更★★★
-    Serial.printf("Compression OK: %u bytes -> %u bytes (%.1f%%)\n",
+    Serial.printf("[DATA] Compression OK: %u bytes -> %u bytes (%.1f%%)\n",
                   (unsigned int)TOTAL_RAW_SIZE, (unsigned int)compressedSize,
                   (float)compressedSize / TOTAL_RAW_SIZE * 100.0);
 
@@ -162,25 +184,34 @@ void sendData()
     {
         memcpy(sendBuffer, &header, sizeof(header));
         memcpy(sendBuffer + sizeof(header), compressedBuffer, compressedSize);
-        const int max_chunk_size = 500;
+
+        Serial.printf("[BLE] Sending total %u bytes in chunks of %d...\n", (unsigned int)totalSize, MAX_CHUNK_SIZE);
+
         size_t bytes_sent = 0;
         while (bytes_sent < totalSize)
         {
             size_t chunk_size = totalSize - bytes_sent;
-            if (chunk_size > max_chunk_size)
+            if (chunk_size > MAX_CHUNK_SIZE)
             {
-                chunk_size = max_chunk_size;
+                chunk_size = MAX_CHUNK_SIZE;
             }
+
             pTxCharacteristic->setValue(sendBuffer + bytes_sent, chunk_size);
             pTxCharacteristic->notify();
+
             bytes_sent += chunk_size;
+            // Serial.printf("[BLE]   Sent chunk: %u / %u bytes\n", (unsigned int)bytes_sent, (unsigned int)totalSize);
+
+            delay(5);
         }
+
         delete[] sendBuffer;
         sampleCounter = 0;
+        Serial.println("[BLE] ✅ Full packet sent. Waiting for next ACK...");
     }
     else
     {
-        Serial.println("Error: Failed to allocate sendBuffer!");
+        Serial.println("[DATA] Error: Failed to allocate sendBuffer!");
         canSendData = true;
     }
 }
@@ -189,7 +220,6 @@ void setup()
 {
     Serial.begin(115200);
     delay(2000);
-    // ★★★ログフォーマット変更★★★
     Serial.println("\n--- EEG Device Booting ---");
 
     uint8_t mac[6];
@@ -197,52 +227,48 @@ void setup()
     snprintf(packetHeader.deviceId, sizeof(packetHeader.deviceId), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     char bleName[32];
     snprintf(bleName, sizeof(bleName), "EEG-Device-%02X%02X", mac[4], mac[5]);
-    Serial.printf("Device ID (MAC): %s\n", packetHeader.deviceId);
+    Serial.printf("[SYS] Device ID (MAC): %s\n", packetHeader.deviceId);
 
     BLEDevice::init(bleName);
-    Serial.printf("BLE Advertising as: %s\n", bleName);
+    Serial.printf("[BLE] BLE Advertising as: %s\n", bleName);
 
-    // 圧縮関連の初期化
     size_t const compressedBufferSize = ZSTD_compressBound(TOTAL_RAW_SIZE);
     compressedBuffer = new uint8_t[compressedBufferSize];
     if (compressedBuffer == NULL)
     {
-        Serial.println("FATAL: Failed to allocate compressedBuffer");
+        Serial.println("[SYS] FATAL: Failed to allocate compressedBuffer");
         while (1)
             ;
     }
     cctx = ZSTD_createCCtx();
     if (cctx == NULL)
     {
-        Serial.println("FATAL: Failed to create ZSTD_CCtx");
+        Serial.println("[SYS] FATAL: Failed to create ZSTD_CCtx");
         while (1)
             ;
     }
+    Serial.println("[SYS] Zstandard compressor initialized.");
 
-    // BLEサービスの初期化
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
     BLEService *pService = pServer->createService(SERVICE_UUID);
     pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
     pTxCharacteristic->addDescriptor(new BLE2902());
-    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
     pRxCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
     pService->start();
 
-    // アドバタイジング開始
     pServer->getAdvertising()->addServiceUUID(SERVICE_UUID);
     pServer->startAdvertising();
-    Serial.println("BLE advertising started. Waiting for a client...");
+    Serial.println("[BLE] BLE advertising started. Waiting for a client...");
 
-    // タイマー割り込みの開始
     timer = timerBegin(0, 80, true);
     timerAttachInterrupt(timer, &onTimer, true);
     timerAlarmWrite(timer, TIMER_INTERVAL_US, true);
     timerAlarmEnable(timer);
 
-    // ★★★ログフォーマット変更★★★
     Serial.println("-------------------------");
-    Serial.println("✅ System Ready.");
+    Serial.println("[SYS] ✅ System Ready.");
 }
 
 void loop()
@@ -279,8 +305,14 @@ void loop()
         else if (!deviceConnected)
         {
             sampleCounter = 0;
-            // ★★★ログフォーマット変更★★★
-            Serial.println("🔹 Packet full. No client connected, discarding data.");
+            Serial.println("[DATA] 🔹 Packet full but no client connected. Discarding data.");
+        }
+        // ★★★★★ 変更点(2): ACK待ち状態を知らせるデバッグログを追加 ★★★★★
+        else if (deviceConnected && !canSendData)
+        {
+            // このログが連続で出る場合、アプリからACKが返ってきていないことを示す
+            Serial.println("[STATE] ⌛ Packet full. Waiting for ACK from the app...");
+            delay(500); // ログが溢れないように少し待つ
         }
     }
 }
