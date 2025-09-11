@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../../TTLab/eeg_analysis_app/stm32"
+		},
+		{
+			"name": "stm32_eeg_sender",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

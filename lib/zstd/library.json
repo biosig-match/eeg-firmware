@@ -1,0 +1,17 @@
+{
+  "name": "zstd-amalgamated",
+  "version": "1.5.5",
+  "description": "Amalgamated Zstandard library for embedded systems",
+  "build": {
+    "flags": [
+      "-D ZSTD_LIB_COMPRESS=1",
+      "-D ZSTD_LIB_DECOMPRESS=0",
+      "-D ZSTD_HEAPMODE=1",
+      "-D ZSTD_NODICT=1",
+      "-D ZSTD_LEGACY_SUPPORT=0"
+    ],
+    "srcFilter": [
+      "+<zstd.c>"
+    ]
+  }
+}
