@@ -74,7 +74,6 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
         uint8_t header = rxValue[0];
         Serial.printf("[RX] ➡️  Received %d bytes. Header: 0x%02X\n", rxLen, header);
 
-        // ★★★★★ 時刻同期(Ping)メッセージの処理を追加 ★★★★★
         // ヘッダ 0xBB, データ長 9 (ヘッダ1 + T1 8)
         if (header == 0xBB && rxLen == 9)
         {
