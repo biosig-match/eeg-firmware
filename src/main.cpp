@@ -10,7 +10,7 @@
 #include <string.h>
 #include <math.h>
 
-// --- 設定 ---
+// --- Configuration ---
 #define NUM_EEG_CHANNELS 8
 #define USE_DUMMY_DATA 1
 const int EEG_PINS[NUM_EEG_CHANNELS] = {A0, A1, A2, A3, A4, A5, 7, 8};
@@ -21,13 +21,13 @@ const int EEG_PINS[NUM_EEG_CHANNELS] = {A0, A1, A2, A3, A4, A5, 7, 8};
 #define TIMER_INTERVAL_US (1000000 / SAMPLE_RATE)
 #define TRIGGER_INTERVAL_SAMPLES (SAMPLE_RATE * 2)
 
-// --- BLE設定 ---
+// --- BLE Configuration ---
 #define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-#define MAX_CHUNK_SIZE 240 // MTUより小さい安全な値
+#define MAX_CHUNK_SIZE 240 // A safe value smaller than MTU
 
-// --- データ構造 ---
+// --- Data Structures ---
 struct __attribute__((packed)) PacketHeader
 {
     char deviceId[18];
@@ -42,7 +42,7 @@ struct __attribute__((packed)) SensorData
     uint32_t timestamp_us;
 };
 
-// --- グローバル変数 ---
+// --- Global Variables ---
 Adafruit_MPU6050 mpu;
 hw_timer_t *timer = nullptr;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
@@ -60,7 +60,7 @@ uint32_t samplesSinceLastTrigger = 0;
 uint8_t *compressedBuffer = nullptr;
 ZSTD_CCtx *cctx = NULL;
 
-// --- BLEコールバック ---
+// --- BLE Callbacks ---
 class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
 {
     void onWrite(BLECharacteristic *pCharacteristic)
@@ -68,27 +68,43 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
         std::string rxValue = pCharacteristic->getValue();
         int rxLen = rxValue.length();
 
-        Serial.print("[ACK] ➡️  ACK received. Length: ");
-        Serial.print(rxLen);
-        Serial.print(", Value: ");
-        for (int i = 0; i < rxLen; i++)
-        {
-            Serial.printf("%02X ", rxValue[i]);
-        }
-        Serial.println();
+        if (rxLen == 0)
+            return;
 
-        if (rxLen > 0)
+        uint8_t header = rxValue[0];
+        Serial.printf("[RX] ➡️  Received %d bytes. Header: 0x%02X\n", rxLen, header);
+
+        // ★★★★★ 時刻同期(Ping)メッセージの処理を追加 ★★★★★
+        // ヘッダ 0xBB, データ長 9 (ヘッダ1 + T1 8)
+        if (header == 0xBB && rxLen == 9)
         {
-            if (rxValue[0] == 0xAA) // Sanity Check / Start signal
-            {
-                Serial.println("[ACK] ✅ Start signal (0xAA) received. Ready to send initial packet.");
-                canSendData = true;
-            }
-            else if (rxValue[0] == 0x01) // Regular ACK
-            {
-                Serial.println("[ACK] ✅ Regular ACK (0x01) received. Ready for next packet.");
-                canSendData = true;
-            }
+            uint64_t t1;
+            memcpy(&t1, rxValue.c_str() + 1, sizeof(t1));
+
+            // T2: このPingメッセージを受信したマイクロ秒単位の時刻
+            uint64_t t2 = (uint64_t)micros();
+            Serial.printf("[SYNC] Ping received. T1=%llu, Captured T2=%llu\n", t1, t2);
+
+            // Pongメッセージを作成して返信
+            // 形式: 0xCC (ヘッダ) + T1 (8バイト) + T2 (8バイト) = 17バイト
+            uint8_t pongPacket[17];
+            pongPacket[0] = 0xCC;
+            memcpy(&pongPacket[1], &t1, sizeof(t1));
+            memcpy(&pongPacket[9], &t2, sizeof(t2));
+
+            pTxCharacteristic->setValue(pongPacket, sizeof(pongPacket));
+            pTxCharacteristic->notify();
+            Serial.println("[SYNC] ⬅️  Pong sent back to app.");
+        }
+        else if (header == 0xAA) // Start signal
+        {
+            Serial.println("[ACK] ✅ Start signal (0xAA) received. Ready to send initial packet.");
+            canSendData = true;
+        }
+        else if (header == 0x01) // Regular ACK for sensor data
+        {
+            Serial.println("[ACK] ✅ Regular ACK (0x01) received. Ready for next packet.");
+            canSendData = true;
         }
     }
 };
@@ -110,7 +126,7 @@ class MyServerCallbacks : public BLEServerCallbacks
     }
 };
 
-// (ISR, MPU切り替え, データ生成は変更なし)
+// --- ISR, Sensor Functions (No changes) ---
 void IRAM_ATTR onTimer()
 {
     portENTER_CRITICAL_ISR(&timerMux);
@@ -146,6 +162,7 @@ void generate_dummy_sensor_data(SensorData *data_ptr)
     }
 }
 
+// --- Data Sending Logic (No changes) ---
 void sendData()
 {
     canSendData = false;
@@ -200,8 +217,6 @@ void sendData()
             pTxCharacteristic->notify();
 
             bytes_sent += chunk_size;
-            // Serial.printf("[BLE]   Sent chunk: %u / %u bytes\n", (unsigned int)bytes_sent, (unsigned int)totalSize);
-
             delay(5);
         }
 
@@ -216,6 +231,7 @@ void sendData()
     }
 }
 
+// --- Setup & Loop ---
 void setup()
 {
     Serial.begin(115200);
@@ -305,14 +321,8 @@ void loop()
         else if (!deviceConnected)
         {
             sampleCounter = 0;
-            Serial.println("[DATA] 🔹 Packet full but no client connected. Discarding data.");
         }
-        // ★★★★★ 変更点(2): ACK待ち状態を知らせるデバッグログを追加 ★★★★★
         else if (deviceConnected && !canSendData)
-        {
-            // このログが連続で出る場合、アプリからACKが返ってきていないことを示す
-            Serial.println("[STATE] ⌛ Packet full. Waiting for ACK from the app...");
-            delay(500); // ログが溢れないように少し待つ
-        }
+        {        }
     }
 }
