@@ -1,7 +1,4 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -9,251 +6,257 @@
 #include <string.h>
 #include <math.h>
 
-// --- Configuration ---
-#define NUM_CHANNELS 8
-#define SAMPLE_RATE 256
-#define TIMER_INTERVAL_US (1000000 / SAMPLE_RATE)
-#define TRIGGER_INTERVAL_SAMPLES (SAMPLE_RATE * 2)
-#define SAMPLES_PER_CHUNK 12
+// ========= ADS1299 実装と互換の設定 =========
+#define DEVICE_NAME "ADS1299_EEG_NUS"
+#define CH_MAX 8
+#define SAMPLE_RATE_HZ 250
+#define SAMPLES_PER_CHUNK 25 // 250SPS / 10Hz = 25
 
-// --- BLE Configuration ---
+// ========= BLE (NUS-like) UUIDs (ADS1299実装と同一) =========
 #define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-#define DEVICE_NAME "EEG-Device"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // Notify
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // Write
 
-// --- Data Structures ---
-struct __attribute__((packed)) SampleData
+// ========= パケット種別 (ADS1299実装と同一) =========
+#define PKT_TYPE_DATA_CHUNK 0x66
+#define PKT_TYPE_DEVICE_CFG 0xDD
+
+// ========= 制御コマンド (ADS1299実装と同一) =========
+#define CMD_START_STREAMING 0xAA
+#define CMD_STOP_STREAMING 0x5B
+
+// ========= データ構造 (ADS1299実装と同一) =========
+struct __attribute__((packed)) ElectrodeConfig
 {
-    uint16_t signals[NUM_CHANNELS];
-    int16_t accel[3];
-    int16_t gyro[3];
-    uint8_t trigger_state; // 0: OFF, 1-255: イベントIDなど
-};
-
-struct __attribute__((packed)) ChunkedSamplePacket
-{
-    uint8_t packet_type;     // パケット種別 (このパケットは 0x66)
-    uint16_t start_index;    // このチャンクの開始サンプルインデックス
-    uint8_t num_samples;     // このチャンクに含まれるサンプル数
-    SampleData samples[SAMPLES_PER_CHUNK];
-};
-
-struct __attribute__((packed)) ElectrodeConfig {
     char name[8];
     uint8_t type;
     uint8_t reserved;
 };
 
-struct __attribute__((packed)) DeviceConfigPacket {
-    uint8_t packet_type;    // パケット種別 (このパケットは 0xDD)
-    uint8_t num_channels;
-    uint8_t reserved[6];
-    ElectrodeConfig configs[NUM_CHANNELS];
+// IMUなし、符号付き16bit信号に修正
+struct __attribute__((packed)) SampleData
+{
+    int16_t signals[CH_MAX]; // 符号付き16bit, little-endian
+    uint8_t trigger_state;   // GPIO下位4bitを模倣 (0..15)
+    uint8_t reserved[3];     // 予約領域
 };
 
-// --- Global Variables ---
-Adafruit_MPU6050 mpu;
-hw_timer_t *timer = nullptr;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool sampleFlag = false;
+struct __attribute__((packed)) ChunkedSamplePacket
+{
+    uint8_t packet_type;  // 0x66
+    uint16_t start_index; // LE
+    uint8_t num_samples;  // 25
+    SampleData samples[SAMPLES_PER_CHUNK];
+};
+
+struct __attribute__((packed)) DeviceConfigPacket
+{
+    uint8_t packet_type;  // 0xDD
+    uint8_t num_channels; // 実使用ch数（今回は8ch固定のダミー）
+    uint8_t reserved[6];
+    ElectrodeConfig configs[CH_MAX];
+};
+
+// ========= グローバル変数 =========
 BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
+
 bool deviceConnected = false;
-volatile bool isStreaming = false;
+volatile bool isStreaming = false; // volatile: 割り込みから変更されるため
 
-uint32_t samplesSinceLastTrigger = 0;
-uint32_t sampleIndexCounter = 0;
+// 送信パケットをグローバルに確保 (スタックオーバーフロー防止)
+ChunkedSamplePacket chunkPacket;
+DeviceConfigPacket deviceConfigPacket;
 
+// BLEコールバックからメインループへ処理を依頼するためのフラグ
+volatile bool g_send_config_packet = false;
+
+// サンプリング用タイマー
+hw_timer_t *timer = nullptr;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool sampleReady = false;
+
+// データバッファとカウンタ
 SampleData sampleBuffer[SAMPLES_PER_CHUNK];
-volatile int bufferCounter = 0;
+volatile int sampleBufferIndex = 0;
+uint16_t sampleIndexCounter = 0;
 
-const ElectrodeConfig electrodeConfigs[NUM_CHANNELS] = {
-    {"Fp1", 0, 0}, {"Fp2", 0, 0}, {"F7", 0, 0}, {"F8", 0, 0},
-    {"T5", 0, 0}, {"T6", 0, 0}, {"O1", 0, 0}, {"O2", 0, 0}
+// ADS1299互換の電極設定
+const ElectrodeConfig defaultElectrodes[CH_MAX] = {
+    {"CH1", 0, 0}, {"CH2", 0, 0}, {"CH3", 0, 0}, {"CH4", 0, 0}, {"CH5", 0, 0}, {"CH6", 0, 0}, {"CH7", 0, 0}, {"CH8", 0, 0}};
+
+// ========= BLEコールバック (ADS1299実装と同一) =========
+class ServerCallbacks : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *s) override
+    {
+        deviceConnected = true;
+        Serial.println(">>> [BLE] Client connected");
+    }
+    void onDisconnect(BLEServer *s) override
+    {
+        deviceConnected = false;
+        isStreaming = false;
+        BLEDevice::startAdvertising();
+        Serial.println(">>> [BLE] Client DISCONNECTED. Streaming stopped. Advertising restarted.");
+    }
 };
 
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-      Serial.println(">>> デバイスが接続されました");
-    }
+class RxCallbacks : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *ch) override
+    {
+        std::string v = ch->getValue();
+        if (v.empty())
+            return;
+        uint8_t cmd = static_cast<uint8_t>(v[0]);
 
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
-      isStreaming = false;
-      BLEDevice::startAdvertising();
-    }
-};
-
-class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string value = pCharacteristic->getValue();
-        if (value.length() > 0) {
-            uint8_t command = value[0];
-            if (command == 0xAA) { // ストリーミング開始コマンド
-                isStreaming = true;
-                sampleIndexCounter = 0;
-                bufferCounter = 0;
-                samplesSinceLastTrigger = 0;
-
-                // デバイス設定情報を送信
-                DeviceConfigPacket configPacket;
-                configPacket.packet_type = 0xDD;
-                configPacket.num_channels = NUM_CHANNELS;
-                memcpy(configPacket.configs, electrodeConfigs, sizeof(electrodeConfigs));
-                pTxCharacteristic->setValue((uint8_t*)&configPacket, sizeof(configPacket));
-                pTxCharacteristic->notify();
-                Serial.println("デバイス設定情報を送信しました");
-
-            } else if (command == 0x5B) { // ストリーミング停止コマンド
-                isStreaming = false;
-                Serial.println("### ストリーミングを停止します ###");
-            }
+        if (cmd == CMD_START_STREAMING)
+        {
+            isStreaming = true;
+            sampleIndexCounter = 0;
+            sampleBufferIndex = 0;
+            g_send_config_packet = true; // メインループに設定情報送信を依頼
+        }
+        else if (cmd == CMD_STOP_STREAMING)
+        {
+            isStreaming = false;
+            Serial.println("[CMD] Stop streaming");
         }
     }
 };
 
-
-// --- ISR, Sensor Functions ---
+// ========= タイマー割り込み処理 =========
 void IRAM_ATTR onTimer()
 {
     portENTER_CRITICAL_ISR(&timerMux);
-    sampleFlag = true;
+    sampleReady = true;
     portEXIT_CRITICAL_ISR(&timerMux);
 }
 
-void generate_high_quality_dummy_data(SampleData *data_ptr)
+// ========= ダミーデータ生成 (ADS1299互換) =========
+void generateDummyAds1299Sample(SampleData &outSample)
 {
-    float time = micros() / 1000000.0f;
-    const float baseline = 32768.0f;
+    float time = (float)micros() / 1000000.0f;
 
-    for (int ch = 0; ch < NUM_CHANNELS; ch++)
+    // 信号を int16_t (-32768 to 32767) の範囲で生成
+    for (int ch = 0; ch < CH_MAX; ch++)
     {
-        float delta = 800.0f * sin(2.0 * PI * 2.0 * time + ch * 1.5);
-        float theta = 1600.0f * sin(2.0 * PI * 6.0 * time + ch * 0.2);
-        float alpha = 12800.0f * sin(2.0 * PI * 10.0 * time + ch * 0.5);
-        float beta = 3200.0f * sin(2.0 * PI * 20.0 * time + ch * 0.3);
-        float drift = 2400.0f * sin(2.0 * PI * 0.5 * time + ch * 0.8);
-        float noise = 800.0f * (rand() % 100 - 50) / 50.0;
-        float combined_signal = baseline + delta + theta + alpha + beta + drift + noise;
-        if(combined_signal < 0) combined_signal = 0;
-        if(combined_signal > 65535) combined_signal = 65535;
-        data_ptr->signals[ch] = (uint16_t)combined_signal;
+        float alpha = 8000.0f * sin(2.0 * PI * 10.0 * time + ch * 0.5);
+        float beta = 2000.0f * sin(2.0 * PI * 20.0 * time + ch * 0.3);
+        float noise = 500.0f * (rand() % 100 - 50) / 50.0;
+        float combined_signal = alpha + beta + noise;
+
+        // 範囲内にクリッピング
+        if (combined_signal < -32767.0)
+            combined_signal = -32767.0;
+        if (combined_signal > 32767.0)
+            combined_signal = 32767.0;
+        outSample.signals[ch] = (int16_t)combined_signal;
     }
 
-    if (samplesSinceLastTrigger >= TRIGGER_INTERVAL_SAMPLES)
-    {
-        data_ptr->trigger_state = 1;
-    } else {
-        data_ptr->trigger_state = 0;
-    }
+    // 1秒ごとにトリガー状態が変化するダミー (0-15の範囲)
+    outSample.trigger_state = (millis() / 250) % 16;
 
-    data_ptr->accel[0] = (int16_t)(sin(2.0 * PI * 0.3 * time) * 2000.0);
-    data_ptr->accel[1] = (int16_t)(cos(2.0 * PI * 0.5 * time) * 2000.0);
-    data_ptr->accel[2] = (int16_t)(-9.8 * 819.2 + sin(2.0 * PI * 0.2 * time) * 1000.0);
-    data_ptr->gyro[0] = (int16_t)(sin(2.0 * PI * 1.5 * time) * 300.0);
-    data_ptr->gyro[1] = (int16_t)(cos(2.0 * PI * 1.0 * time) * 300.0);
-    data_ptr->gyro[2] = (int16_t)(sin(2.0 * PI * 2.0 * time) * 300.0);
+    // 予約領域を0で埋める
+    memset(outSample.reserved, 0, sizeof(outSample.reserved));
 }
 
-// --- Setup & Loop ---
+// ========= Setup =========
 void setup()
 {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n--- EEG Device Booting (v4 - 16bit Precision & Dedicated Trigger) ---");
+    Serial.println("\n--- ADS1299-Compatible Dummy Data Streamer ---");
 
-    // 1. BLEデバイスを初期化 (デバイス名を設定)
+    // BLEデバイス初期化
     BLEDevice::init(DEVICE_NAME);
-    Serial.println("BLEデバイス初期化完了");
-
-    // 2. BLEサーバーを作成
     pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    Serial.println("BLEサーバー作成完了");
-
-    // 3. BLEサービスを作成
+    pServer->setCallbacks(new ServerCallbacks());
     BLEService *pService = pServer->createService(SERVICE_UUID);
-    Serial.println("BLEサービス作成完了");
 
-    // 4. TXキャラクタリスティックを作成 (Notify: サーバー→クライアント)
+    // TX Characteristic (Notify)
     pTxCharacteristic = pService->createCharacteristic(
-                                CHARACTERISTIC_UUID_TX,
-                                BLECharacteristic::PROPERTY_NOTIFY
-                            );
+        CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
     pTxCharacteristic->addDescriptor(new BLE2902());
-    Serial.println("TXキャラクタリスティック作成完了");
 
-    // 5. RXキャラクタリスティックを作成 (Write: クライアント→サーバー)
+    // RX Characteristic (Write)
     BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
-                                            CHARACTERISTIC_UUID_RX,
-                                            BLECharacteristic::PROPERTY_WRITE
-                                        );
-    pRxCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
-    Serial.println("RXキャラクタリスティック作成完了");
+        CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
+    pRxCharacteristic->setCallbacks(new RxCallbacks());
 
-    // 6. サービスを開始
     pService->start();
-    Serial.println("サービス開始");
-
-    // 7. アドバタイズを開始
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(SERVICE_UUID);
+    adv->setScanResponse(true);
     BLEDevice::startAdvertising();
-    Serial.println("★★★ アドバタイズ開始: 他のデバイスから 'EEG-Device' が見えます ★★★");
+    Serial.println("BLE advertising started (ADS1299-NUS compatible)");
 
-    // タイマー設定
-    timer = timerBegin(0, 80, true);
+    // サンプリング用タイマー設定
+    const int timer_id = 0;
+    const uint32_t prescaler = 80; // 80MHz / 80 = 1MHz
+    const uint64_t alarm_value = 1000000 / SAMPLE_RATE_HZ;
+    timer = timerBegin(timer_id, prescaler, true);
     timerAttachInterrupt(timer, &onTimer, true);
-    timerAlarmWrite(timer, TIMER_INTERVAL_US, true);
+    timerAlarmWrite(timer, alarm_value, true);
     timerAlarmEnable(timer);
-    Serial.println("サンプリングタイマー起動完了");
+    Serial.printf("Sampling timer started for %d Hz\n", SAMPLE_RATE_HZ);
 }
 
-
+// ========= Loop =========
 void loop()
 {
-    if (sampleFlag)
+    // --- [1] BLEコールバックからの設定情報送信要求を処理 ---
+    if (g_send_config_packet)
     {
-        portENTER_CRITICAL(&timerMux);
-        sampleFlag = false;
-        portEXIT_CRITICAL(&timerMux);
-
-        if (deviceConnected && isStreaming)
+        g_send_config_packet = false;
+        if (deviceConnected)
         {
-            if (bufferCounter < SAMPLES_PER_CHUNK)
-            {
-                SampleData currentSample;
-                generate_high_quality_dummy_data(&currentSample);
+            deviceConfigPacket.packet_type = PKT_TYPE_DEVICE_CFG;
+            deviceConfigPacket.num_channels = CH_MAX; // 8chのダミーデバイスとして通知
+            memset(deviceConfigPacket.reserved, 0, sizeof(deviceConfigPacket.reserved));
+            memcpy(deviceConfigPacket.configs, defaultElectrodes, sizeof(defaultElectrodes));
 
-                if (currentSample.trigger_state == 1) {
-                    samplesSinceLastTrigger = 0;
-                }
-                samplesSinceLastTrigger++;
+            pTxCharacteristic->setValue((uint8_t *)&deviceConfigPacket, sizeof(deviceConfigPacket));
+            pTxCharacteristic->notify();
 
-                memcpy(&sampleBuffer[bufferCounter], &currentSample, sizeof(SampleData));
-                bufferCounter++;
-                sampleIndexCounter++;
-            }
-
-            if (bufferCounter >= SAMPLES_PER_CHUNK)
-            {
-                ChunkedSamplePacket packet;
-                packet.packet_type = 0x66;
-                packet.num_samples = SAMPLES_PER_CHUNK;
-                packet.start_index = sampleIndexCounter - SAMPLES_PER_CHUNK;
-                memcpy(packet.samples, sampleBuffer, sizeof(sampleBuffer));
-
-                pTxCharacteristic->setValue((uint8_t*)&packet, sizeof(packet));
-                pTxCharacteristic->notify();
-                
-                // Serial.printf("--- Sent BLE Chunk (Start Index: %u) ---\n", packet.start_index);
-                
-                bufferCounter = 0;
-            }
+            Serial.println("[CMD] Start streaming -> Sent DeviceConfigPacket");
+            delay(10); // 送信処理のための短い待機
         }
+    }
+
+    // --- [2] ストリーミング中のデータ生成とバッファリング ---
+    if (isStreaming && deviceConnected)
+    {
+        if (sampleReady)
+        {
+            portENTER_CRITICAL(&timerMux);
+            sampleReady = false;
+            portEXIT_CRITICAL(&timerMux);
+
+            // ダミーデータを生成してバッファに格納
+            generateDummyAds1299Sample(sampleBuffer[sampleBufferIndex]);
+            sampleBufferIndex++;
+            sampleIndexCounter++;
+        }
+
+        // --- [3] バッファが満たされたらBLEで送信 ---
+        if (sampleBufferIndex >= SAMPLES_PER_CHUNK)
+        {
+            chunkPacket.packet_type = PKT_TYPE_DATA_CHUNK;
+            chunkPacket.start_index = (uint16_t)(sampleIndexCounter - SAMPLES_PER_CHUNK);
+            chunkPacket.num_samples = SAMPLES_PER_CHUNK;
+            memcpy(chunkPacket.samples, sampleBuffer, sizeof(sampleBuffer));
+
+            pTxCharacteristic->setValue((uint8_t *)&chunkPacket, sizeof(chunkPacket));
+            pTxCharacteristic->notify();
+
+            sampleBufferIndex = 0; // バッファインデックスをリセット
+        }
+    }
+    else
+    {
+        // ストリーミング中でない場合はCPUを少し休ませる
+        delay(10);
     }
 }
